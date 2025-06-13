@@ -141,6 +141,40 @@ class AccountService:
                 f"Unexpected error while querying account data: {str(e)}"
             )
     
+    def get_all_unique_logins(self) -> list[int]:
+        """
+        Get all unique login IDs from the accounts database using Polars lazy API
+        
+        Returns:
+            list[int]: List of unique login IDs
+            
+        Raises:
+            AccountServiceError: If there's an error reading the CSV file
+        """
+        try:
+            # Use lazy scanning for efficient processing
+            unique_logins_query = (
+                pl.scan_csv(self._accounts_file)
+                .select(pl.col("login"))  # Select only the login column
+                .unique()  # Get unique values
+            )
+            
+            # Execute the lazy query and collect results
+            result_df = unique_logins_query.collect()
+            
+            # Convert to list of integers
+            unique_logins = result_df["login"].to_list()
+            return unique_logins
+            
+        except pl.exceptions.PolarsError as e:
+            raise AccountServiceError(
+                f"Error reading accounts data from {self._accounts_file}: {str(e)}"
+            )
+        except Exception as e:
+            raise AccountServiceError(
+                f"Unexpected error while querying unique logins: {str(e)}"
+            )
+
     def get_data_path(self) -> Path:
         """Get the validated data directory path"""
         return self._data_path

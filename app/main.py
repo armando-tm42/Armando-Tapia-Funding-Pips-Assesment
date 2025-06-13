@@ -3,16 +3,37 @@ Main entry point for the FastAPI application
 """
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from apscheduler.schedulers.background import BackgroundScheduler
 from app.api.routes import api_router
 from app.core.config import settings
 from app.db.database import create_app_tables
+from app.workers.scheduler import create_scheduler, start_scheduler, shutdown_scheduler
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Create scheduler instance
+    scheduler: BackgroundScheduler = create_scheduler()
+    
     # Startup
+    logger.info("Starting FastAPI application...")
+    
+    # Create database tables
     await create_app_tables()
+    logger.info("Database tables created/verified")
+    
+    # Start scheduler
+    start_scheduler(scheduler)
+    
     yield
-    # Shutdown (if needed)
+    
+    # Shutdown
+    logger.info("Shutting down FastAPI application...")
+    shutdown_scheduler(scheduler)
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application"""

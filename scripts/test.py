@@ -1,27 +1,27 @@
 from sys import path
-path.append("..")
+path.append(".")
 
-from app.services.trade_service import TradeService, get_profit_factor_filters, get_win_ratio_filters, get_hft_count_filters, get_weighted_sl_percent_filters, get_layered_trade_filters, get_max_relative_drawdown_filter
-import polars as pl
+from app.services.indicators_service import create_indicators_service, get_all_trading_indicators, get_max_relative_drawdown_filter
+from app.services.trade_service import create_trade_service
 
 if __name__ == "__main__":
-    trade_service = TradeService()
-    lazy_frame: pl.LazyFrame = trade_service.create_rolling_window_lazy_frame(account_login=10486272, period="1m")
-    hft_count_filters = get_hft_count_filters()
-    win_ratio_filters = get_win_ratio_filters()
-    profit_factor_filters = get_profit_factor_filters()
-    weighted_sl_percent_filters = get_weighted_sl_percent_filters()
-    layered_trade_filters = get_layered_trade_filters()
-    max_relative_drawdown_filter = get_max_relative_drawdown_filter()
-    lazy_frame = lazy_frame.agg(
-        hft_count_filters + 
-        win_ratio_filters + 
-        profit_factor_filters + 
-        weighted_sl_percent_filters + 
-        layered_trade_filters +
-        max_relative_drawdown_filter
-    )
-    
-    df = lazy_frame.collect()
 
-    df.write_csv("test.csv")
+    # indicators_service = create_indicators_service()
+
+    # indicators_service.execute_bulk_analysis()
+
+    trade_service = create_trade_service()
+
+    group_by = trade_service.create_rolling_window_lazy_frame(
+        account_login=100716975,
+        period="1m",
+        equity=100_000
+    )
+
+    indicators = get_all_trading_indicators()
+    
+
+
+    trades_summary_records = group_by.agg(get_max_relative_drawdown_filter()).collect()
+
+    trades_summary_records.write_csv("trades_summary_records.csv")

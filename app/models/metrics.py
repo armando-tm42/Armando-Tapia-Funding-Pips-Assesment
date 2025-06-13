@@ -3,7 +3,7 @@ Metrics SQLAlchemy model
 """
 from datetime import date
 from sqlalchemy import Column, Integer, Float, Boolean, Date, UniqueConstraint, CheckConstraint
-from app.db.database import Base
+from app.models import Base
 
 class Metrics(Base):
     """SQLAlchemy model for metrics data"""

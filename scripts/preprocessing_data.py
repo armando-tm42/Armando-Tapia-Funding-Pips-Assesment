@@ -11,8 +11,10 @@ from typing import (
     Iterator,
     Tuple,
     Dict,
-    Any
+    Any,
+    List
 )
+from tempfile import NamedTemporaryFile
 
 import polars as pl
 from dotenv import load_dotenv
@@ -165,6 +167,82 @@ def copy_accounts_file(source_file: str, target_file: str) -> None:
     except Exception as e:
         print(f"❌ Error processing accounts file: {e}")
         sys.exit(1)
+
+# --- External Sorting Utilities ---
+def sort_and_save_chunk(rows: List[List[str]], sort_key: int, chunk_id: int) -> str:
+    """
+    Sorts a chunk of rows by the given column index and saves to a temp file.
+    Returns the temp file path.
+    """
+    rows.sort(key=lambda r: r[sort_key])
+    tmp = NamedTemporaryFile(delete=False, mode='w', newline='')
+    writer = csv.writer(tmp)
+    writer.writerows(rows)
+    tmp.close()
+    return tmp.name
+
+def merge_chunks(filepaths: List[str], output_path: str):
+    """
+    Merge sorted chunk files into a single sorted output file.
+    Assumes all input files are sorted by the same key.
+    """
+    files = [open(fp, newline='') for fp in filepaths]
+    readers = [csv.reader(f) for f in files]
+    heap = []
+    for i, r in enumerate(readers):
+        try:
+            row = next(r)
+            heap.append((row, i))
+        except StopIteration:
+            pass
+    heapq.heapify(heap)
+
+    with open(output_path, 'w', newline='') as out_file:
+        writer = csv.writer(out_file)
+        while heap:
+            row, i = heapq.heappop(heap)
+            writer.writerow(row)
+            try:
+                next_row = next(readers[i])
+                heapq.heappush(heap, (next_row, i))
+            except StopIteration:
+                pass
+    for f in files:
+        f.close()
+
+# --- Per-file external sort integration ---
+def external_sort_csv(input_path: str, output_path: str, sort_column: str, chunk_size: int = 100_000):
+    """
+    Sort a large CSV file by the given column using external sorting (chunked + merge).
+    """
+    print(f"🔄 External sorting: {input_path} by '{sort_column}'...")
+    chunk_files = []
+    with open(input_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        sort_idx = headers.index(sort_column)
+        chunk = []
+        chunk_id = 0
+        for row in reader:
+            chunk.append(row)
+            if len(chunk) >= chunk_size:
+                tmp_path = sort_and_save_chunk(chunk, sort_idx, chunk_id)
+                chunk_files.append(tmp_path)
+                chunk = []
+                chunk_id += 1
+        if chunk:
+            tmp_path = sort_and_save_chunk(chunk, sort_idx, chunk_id)
+            chunk_files.append(tmp_path)
+    # Merge all sorted chunks
+    print(f"   - Merging {len(chunk_files)} sorted chunks...")
+    with open(output_path, 'w', newline='', encoding='utf-8') as out_f:
+        writer = csv.writer(out_f)
+        writer.writerow(headers)
+    merge_chunks(chunk_files, output_path)
+    # Clean up temp files
+    for fp in chunk_files:
+        os.remove(fp)
+    print(f"✅ Sorted file saved to {output_path}")
 
 def main():
     """Main preprocessing function"""

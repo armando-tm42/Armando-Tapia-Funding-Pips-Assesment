@@ -4,13 +4,13 @@ Provides trade data access functionality with data validation
 """
 import os
 from pathlib import Path
-from typing import Optional, List
-from datetime import date
+from typing import Optional
+from datetime import datetime, timedelta
 
 import polars as pl
+from polars.lazyframe.group_by import LazyGroupBy
+from polars import LazyFrame, col, when, lit
 from dotenv import load_dotenv
-
-INITIAL_EQUITY = 100_000
 
 class TradeServiceError(Exception):
     """Custom exception for trade service errors"""
@@ -111,22 +111,99 @@ class TradeService:
         """Get the path to the trades CSV file"""
         return self._trades_file
 
+    def compute_max_relative_drawdown(
+        self,
+        lazy_frame: LazyFrame, 
+        initial_equity: float,
+        starting_equity: Optional[float] = None,
+        starting_peak: Optional[float] = None
+    ) -> LazyFrame:
+        """
+        Compute the global max relative drawdown for a given lazy frame.
+        The result will have 'equity', 'global_peak', and 'global_drawdown' columns.
+        """
+        # Determine starting values
+        base_equity = starting_equity if starting_equity is not None else initial_equity
+        base_peak = starting_peak if starting_peak is not None else initial_equity
+
+        # Compute equity curve (incremental from base_equity)
+        lazy_frame = lazy_frame.with_columns([
+            (lit(base_equity) + col("profit").cum_sum() + col("swap").cum_sum() + col("commission").cum_sum()).alias("equity")
+        ])
+
+        # Compute global peak equity (cumulative max)
+        lazy_frame = lazy_frame.with_columns([
+            col("equity").cum_max().clip(lower_bound=base_peak).alias("global_peak")
+        ])
+
+        # Compute global relative drawdown
+        lazy_frame = lazy_frame.with_columns([
+            ((col("equity") - col('global_peak')) / col('global_peak')).alias("global_drawdown")
+        ])
+
+        return lazy_frame
+
+    def get_most_recent_trade_timestamp(self, account_login: int) -> Optional[datetime]:
+        """
+        Get the most recent trade timestamp (closed_at) for a specific account login
+        
+        Args:
+            account_login: The trading account login ID to filter by
+            
+        Returns:
+            The most recent closed_at timestamp for the account, or None if no trades found
+            
+        Raises:
+            TradeServiceError: If there's an error reading or processing the trades data
+        """
+        try:
+            # Create lazy frame and filter by account login
+            lazy_frame = pl.scan_csv(self._trades_file)
+            
+            # Convert closed_at to datetime and filter by account
+            result = (
+                lazy_frame
+                .with_columns([
+                    pl.col("closed_at").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S%.f")
+                ])
+                .filter(pl.col("trading_account_login") == account_login)
+                .select(pl.col("closed_at").max().alias("latest_trade"))
+                .collect()
+            )
+            
+            # Extract the result
+            if result.is_empty() or result["latest_trade"][0] is None:
+                return None
+                
+            return result["latest_trade"][0]
+            
+        except Exception as e:
+            raise TradeServiceError(f"Error getting most recent trade timestamp for login {account_login}: {str(e)}")
+
     def create_rolling_window_lazy_frame(
         self, 
         account_login: int, 
         period: str = "1m",
-        start_date: Optional[date] = None
-    ) -> Optional[pl.LazyFrame]:
+        period_seconds: int = 60,
+        equity: float = 100_000,
+        resume_from_equity: Optional[float] = None,
+        resume_from_peak: Optional[float] = None,
+        resume_from_datetime: Optional[datetime] = None
+    ) -> Optional[LazyGroupBy]: 
         """
         Create a dynamic group-by lazy frame for trades using Polars
+        Can resume computation from a previous state for incremental processing
 
         Args:
             account_login: MT login
             period: time-based grouping window (e.g. "1h", "1d")
-            start_date: Optional filter for start date
+            equity: Initial equity for fresh calculations
+            resume_from_equity: Last known equity value (for resuming)
+            resume_from_peak: Last known peak equity value (for resuming)
+            resume_from_datetime: Last computed window datetime (for filtering new trades)
 
         Returns:
-            pl.LazyFrame with dynamic group_by ready to be aggregated
+            LazyGroupBy with dynamic group_by ready to be aggregated
         """
         try:
             lazy_frame = pl.scan_csv(self._trades_file)
@@ -137,35 +214,34 @@ class TradeService:
                 pl.col("closed_at").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S%.f")
             ])
 
+            #filter by account login
             lazy_frame = lazy_frame.filter(
                 pl.col("trading_account_login") == account_login
             )
 
-            #compute equity curve
-            lazy_frame = lazy_frame.with_columns([
-                (pl.lit(INITIAL_EQUITY) + pl.col("profit").cum_sum() + pl.col("swap").cum_sum() + pl.col("commission").cum_sum()).alias("equity")
-            ])
+            # Filter for incremental processing if resuming from previous state
+            if resume_from_datetime:
 
-            #compute peak equity
-            lazy_frame = lazy_frame.with_columns([
-                pl.col("equity").cum_max().alias("peak")
-            ])
-
-            #compute relative drawdown
-            lazy_frame = lazy_frame.with_columns([
-                ((pl.col("equity") - pl.col('peak')) / pl.col('peak')).alias("relative_drawdown")
-            ])
-
-            if start_date:
+                next_window_start = resume_from_datetime + timedelta(seconds=period_seconds)
+                
                 lazy_frame = lazy_frame.filter(
-                    pl.col("opened_at") >= start_date.isoformat()
+                    pl.col("closed_at") >= next_window_start
                 )
 
-            # Crear una ventana dinámica (rolling tipo bucket)
+
+            #compute max relative drawdown (with optional resumable state)
+            lazy_frame = self.compute_max_relative_drawdown(
+                lazy_frame, 
+                equity,
+                starting_equity=resume_from_equity,
+                starting_peak=resume_from_peak
+            )
+
+            # Create a rolling window by using group_by_dynamic
             lazy_window = lazy_frame.group_by_dynamic(
                 index_column="closed_at",
                 every="1m",
-                period=period,
+                period="1m",
                 include_boundaries=True,
                 closed="left"
             )
@@ -176,156 +252,32 @@ class TradeService:
             print(f"Error creating rolling window lazy frame: {e}")
             return None
     
-def get_hft_count_filters() -> List[pl.Expr]:
-    """
-    Calculate HFT count by counting trades with duration less than 60 seconds
-    
-    Returns:
-        List[pl.Expr]: Polars expressions to calculate HFT count
-    """
-    return [
-        pl.when(
-            (pl.col("closed_at") - pl.col("opened_at")).dt.total_seconds() < 60
-        ).then(1).otherwise(0).sum().alias("hft")
-    ]
+    def count_trades_for_account(self, account_login: int, closed_at: Optional[datetime] = None) -> int:
+        """
+        Count the number of trade records for a given account login, optionally filtered by closed_at (datetime).
+        If closed_at is provided, only count records with closed_at strictly greater than the given value.
+        Uses Polars lazy API for efficient streaming/counting.
 
-def get_win_ratio_filters() -> List[pl.Expr]:
-    """
-    Calculate the win rate for a given lazy frame
-    """
-    return [
-        (pl.when(pl.col("profit") > 0).then(1).otherwise(0).sum() / pl.count()).alias("win_ratio")
-    ]
+        Args:
+            account_login: The trading account login ID to filter by
+            closed_at: Optional closed_at value to filter by (must be a datetime)
 
-def get_profit_factor_filters() -> List[pl.Expr]:
-    """
-    Calculate the profit factor for a given lazy frame
-    Handles edge cases: returns 0 if no winning trades or no losing trades
-    """
-    gross_profit = pl.when(pl.col("profit") > 0).then(pl.col("profit")).otherwise(0).sum()
-    gross_loss = pl.when(pl.col("profit") < 0).then(pl.col("profit").abs()).otherwise(0).sum()
-    
-    return [
-        pl.when(gross_profit == 0)
-        .then(0)  # No winning trades → profit factor = 0
-        .when(gross_loss == 0)
-        .then(0)  # No losing trades → return 0 instead of inf
-        .otherwise(gross_profit / gross_loss)  # Normal case
-        .alias("profit_factor")
-    ]
-
-def get_max_relative_drawdown_filter() -> List[pl.Expr]:
-    """
-    Calculate the equity curve for a given lazy frame
-    """
-    return [
-        pl.col("commission").sum().alias("total_commission"),
-        pl.col("swap").sum().alias("total_swap"),
-        pl.col("profit").sum().alias("total_profit"),
-        pl.col("relative_drawdown").min().alias("max_relative_drawdown"),
-        pl.col("identifier").count().alias("total_trades")
-    ]
-
-def get_weighted_sl_percent_filters() -> List[pl.Expr]:
-    """
-    Calculate the weighted stop loss percentage based on position size
-    
-    Logic:
-    - If price_sl is not null: compute sl% using open_price and price_sl
-    - If price_sl is null: infer sl% using open_price and close_price
-    - Position size = lot_size * contract_size * open_price
-    - Action: 0 = BUY, 1 = SELL
-    - Weighted sl% = sum(sl_percent * position_size) / sum(position_size)
-    """
-    
-    # Calculate position size
-    position_size = pl.col("lot_size") * pl.col("contract_size") * pl.col("open_price")
-    
-    # Calculate sl_percent based on whether price_sl is null or not
-    # For BUY trades (action = 0): sl% = (open_price - sl_price) / open_price  
-    # For SELL trades (action = 1): sl% = (sl_price - open_price) / open_price
-    
-    sl_percent = (
-        pl.when(pl.col("price_sl").is_not_null())
-        .then(
-            # Use price_sl when available
-            pl.when(pl.col("action") == 0)  # BUY
-            .then((pl.col("open_price") - pl.col("price_sl")) / pl.col("open_price"))
-            .otherwise((pl.col("price_sl") - pl.col("open_price")) / pl.col("open_price"))  # SELL
-        )
-        .otherwise(
-            # Infer from close_price when price_sl is null
-            pl.when(pl.col("action") == 0)  # BUY
-            .then((pl.col("open_price") - pl.col("close_price")) / pl.col("open_price"))
-            .otherwise((pl.col("close_price") - pl.col("open_price")) / pl.col("open_price"))  # SELL
-        )
-    )
-    
-    # Calculate weighted sl percentage
-    weighted_sl_percent = (sl_percent * position_size).sum() / position_size.sum()
-    
-    return [
-        weighted_sl_percent.alias("sl_percent")
-    ]
-
-def get_layered_trade_filters() -> List[pl.Expr]:
-    """
-    Calculate layered trade count for trades that:
-    1. Have duration < 60 seconds  
-    2. Open at the exact same timestamp (grouped by opened_at)
-    3. Count only trades where multiple trades happen at same time
-    
-    Layered trades are short-duration trades that happen simultaneously,
-    indicating potential high-frequency trading strategies.
-    
-    Approach: Create a helper column with opened_at only for short trades,
-    then count unique timestamps and compare with total short trades.
-    """
-    # Define the condition for short trades (< 60 seconds duration)
-    is_short_duration = (pl.col("closed_at") - pl.col("opened_at")).dt.total_seconds() < 60
-    
-    return [
-        # Total short trades in window
-        pl.when(is_short_duration)
-        .then(1)
-        .otherwise(0)
-        .sum()
-        .alias("short_trades_total"),
-        
-        # Unique opened_at timestamps for short trades
-        pl.when(is_short_duration)
-        .then(pl.col("opened_at"))
-        .otherwise(None)
-        .n_unique()
-        .alias("unique_short_timestamps"),
-        
-        # Layered trades = short_trades_total - unique_timestamps  
-        # If we have more trades than unique timestamps, the difference is layered trades
-        # Handle edge case: if no short trades exist, return 0
-        pl.when(
-            pl.when(is_short_duration).then(1).otherwise(0).sum() == 0
-        )
-        .then(0)  # No short trades = no layered trades
-        .otherwise(
-            pl.when(is_short_duration).then(1).otherwise(0).sum() - 
-            pl.when(is_short_duration).then(pl.col("opened_at")).otherwise(None).drop_nulls().n_unique()
-        )
-        .clip(lower_bound=0)  # Ensure non-negative
-        .alias("layered_trade_count")
-    ]
-
-def get_last_trade_filters() -> List[pl.Expr]:
-    """
-    Get the last trade information for each rolling window
-    
-    Returns expressions to capture the last trade's key metrics
-    based on the most recent opened_at timestamp in the window
-    """
-    return [
-        # Last trade's opening time
-        pl.col("opened_at").last().alias("last_trade_at"),
-        
-    ]
+        Returns:
+            Number of matching records (int)
+        """
+        try:
+            lazy_frame = pl.scan_csv(self._trades_file)
+            lf = lazy_frame.filter(pl.col("trading_account_login") == account_login)
+            if closed_at is not None:
+                # Parse closed_at column as datetime for comparison
+                lf = lf.with_columns([
+                    pl.col("closed_at").str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S%.f").alias("closed_at_dt")
+                ])
+                lf = lf.filter(pl.col("closed_at_dt") > closed_at)
+            result = lf.select(pl.count()).collect()
+            return int(result[0, 0])
+        except Exception as e:
+            raise TradeServiceError(f"Failed to count trades for account {account_login}: {str(e)}")
 
 def create_trade_service() -> TradeService:
     """
